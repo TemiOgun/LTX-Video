@@ -20,8 +20,9 @@ import uvicorn
 from PIL import Image
 import imageio
 
-# Import the necessary functions from your inference.py
-from ltx_video.pipelines.pipeline_ltx_video import ConditioningItem, LTXVideoPipeline
+# Fixed imports - replace ConditioningItem with correct imports
+from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline
+from ltx_video.utils.conditioning_method import ConditioningMethod
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
 
 # Import these functions from your inference.py
