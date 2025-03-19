@@ -3,12 +3,14 @@ import base64
 import tempfile
 import shutil
 import uuid
+import random
 from typing import List, Optional, Union
 from pathlib import Path
 import logging
 from datetime import datetime
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, Form, BackgroundTasks
 from fastapi.security.api_key import APIKeyHeader, APIKey
@@ -20,18 +22,19 @@ import uvicorn
 from PIL import Image
 import imageio
 
-# Fixed imports - replace ConditioningItem with correct imports
+# Import from inference.py instead of defining references to missing functions
+from inference import (
+    seed_everething, calculate_padding, load_image_to_tensor_with_resize_and_crop, 
+    load_vae, load_unet, load_scheduler, convert_prompt_to_filename, get_unique_filename
+)
+
+# Import directly from packages
 from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline
 from ltx_video.utils.conditioning_method import ConditioningMethod
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
-
-# Import these functions from your inference.py
-from inference import (
-    get_device, seed_everething, calculate_padding, 
-    load_image_to_tensor_with_resize_and_crop, 
-    create_ltx_video_pipeline, prepare_conditioning, 
-    get_unique_filename
-)
+from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifier
+from transformers import T5EncoderModel, T5Tokenizer
+from q8_kernels.graph.graph import make_dynamic_graphed_callable
 
 # Health check endpoint for dstack
 class HealthCheck(BaseModel):
@@ -81,23 +84,9 @@ class VideoGenerationRequest(BaseModel):
     width: int = 704
     frame_rate: int = 25
     guidance_scale: float = 3.0
-    stg_scale: float = 1.0
-    stg_rescale: float = 0.7
-    stg_mode: str = "attention_values"
-    stg_skip_layers: str = "19"
-    image_cond_noise_scale: float = 0.15
-    decode_timestep: float = 0.025
-    decode_noise_scale: float = 0.0125
-    precision: str = "bfloat16"
-    sampler: Optional[str] = None
-    prompt_enhancement_words_threshold: int = 50
     low_vram: bool = LOW_VRAM
     transformer_type: str = TRANSFORMER_TYPE
 
-class ConditioningMedia(BaseModel):
-    start_frame: int
-    strength: float = 1.0
-    
 class VideoGenerationResponse(BaseModel):
     job_id: str
     status: str = "processing"
@@ -139,6 +128,10 @@ def get_api_key(api_key: str = Depends(api_key_header)):
         )
     return api_key
 
+def get_device():
+    """Return the appropriate device for model operations."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
 def save_upload_file_temporarily(upload_file: UploadFile) -> Path:
     """Save an upload file temporarily and return the path."""
     temp_file = Path(TEMP_DIR) / f"{uuid.uuid4()}_{upload_file.filename}"
@@ -165,59 +158,26 @@ async def generate_video(
     width: int = Form(704),
     frame_rate: int = Form(25),
     guidance_scale: float = Form(3.0),
-    stg_scale: float = Form(1.0),
-    stg_rescale: float = Form(0.7),
-    stg_mode: str = Form("attention_values"),
-    stg_skip_layers: str = Form("19"),
-    image_cond_noise_scale: float = Form(0.15),
-    decode_timestep: float = Form(0.025),
-    decode_noise_scale: float = Form(0.0125),
-    precision: str = Form("bfloat16"),
     low_vram: bool = Form(LOW_VRAM),
     transformer_type: str = Form(TRANSFORMER_TYPE),
-    conditioning_files: List[UploadFile] = File(None),
-    conditioning_strengths: str = Form(None),  # Comma-separated list of floats
-    conditioning_start_frames: str = Form(None),  # Comma-separated list of integers
+    conditioning_file: UploadFile = File(None),
     api_key: APIKey = Depends(get_api_key)
 ):
     job_id = str(uuid.uuid4())
     logger.info(f"Starting job {job_id} for prompt: {prompt}")
     
-    # Parse lists from form data
-    temp_files = []
-    conditioning_media_paths = []
-    
-    if conditioning_files:
-        for upload_file in conditioning_files:
-            if upload_file.filename:  # Skip if no file provided
-                temp_file = await save_upload_file_temporarily(upload_file)
-                temp_files.append(temp_file)
-                conditioning_media_paths.append(str(temp_file))
-    
-    parsed_strengths = []
-    if conditioning_strengths:
-        parsed_strengths = [float(s.strip()) for s in conditioning_strengths.split(",")]
-        
-    parsed_start_frames = []
-    if conditioning_start_frames:
-        parsed_start_frames = [int(s.strip()) for s in conditioning_start_frames.split(",")]
-    
-    # Validate conditioning parameters
-    if conditioning_media_paths:
-        if len(parsed_strengths) != len(conditioning_media_paths):
-            parsed_strengths = [1.0] * len(conditioning_media_paths)
-        if len(parsed_start_frames) != len(conditioning_media_paths):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Number of conditioning start frames must match number of conditioning files"
-            )
+    # Save conditioning image if provided
+    conditioning_image_path = None
+    if conditioning_file and conditioning_file.filename:
+        temp_file = await save_upload_file_temporarily(conditioning_file)
+        conditioning_image_path = str(temp_file)
     
     # Store job parameters
     job_params = {
         "job_id": job_id,
-        "ckpt_path": os.environ.get("LTX_VIDEO_CKPT_PATH", "./models/ltx_video_q8_model.safetensors"),
-        "text_encoder_model_name_or_path": os.environ.get("LTX_VIDEO_TEXT_ENCODER", "PixArt-alpha/PixArt-XL-2-1024-MS"),
-        "temp_files": temp_files,
+        "ckpt_dir": os.environ.get("LTX_VIDEO_CKPT_PATH", "./models"),
+        "unet_path": os.environ.get("LTX_VIDEO_UNET_PATH", "konakona/ltxvideo_q8"),
+        "temp_file": conditioning_image_path,
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "seed": seed,
@@ -227,19 +187,7 @@ async def generate_video(
         "width": width,
         "frame_rate": frame_rate,
         "guidance_scale": guidance_scale,
-        "stg_scale": stg_scale,
-        "stg_rescale": stg_rescale,
-        "stg_mode": stg_mode,
-        "stg_skip_layers": stg_skip_layers,
-        "image_cond_noise_scale": image_cond_noise_scale,
-        "decode_timestep": decode_timestep,
-        "decode_noise_scale": decode_noise_scale,
-        "precision": precision,
-        "conditioning_media_paths": conditioning_media_paths,
-        "conditioning_strengths": parsed_strengths,
-        "conditioning_start_frames": parsed_start_frames,
-        "output_path": str(OUTPUT_DIR),
-        "offload_to_cpu": True,
+        "output_dir": str(OUTPUT_DIR),
         "device": get_device(),
         "low_vram": low_vram,
         "transformer_type": transformer_type
@@ -312,7 +260,7 @@ async def delete_job(job_id: str, api_key: APIKey = Depends(get_api_key)):
 
 def process_video_generation(job_params):
     job_id = job_params["job_id"]
-    temp_files = job_params.pop("temp_files", [])
+    temp_file = job_params.pop("temp_file", None)
     
     try:
         seed_everething(job_params["seed"])
@@ -328,79 +276,62 @@ def process_video_generation(job_params):
         
         padding = calculate_padding(height, width, height_padded, width_padded)
         
-        # Create pipeline
-        prompt_word_count = len(job_params["prompt"].split())
-        prompt_enhancement_threshold = job_params.get("prompt_enhancement_words_threshold", 50)
-        enhance_prompt = (
-            prompt_enhancement_threshold > 0
-            and prompt_word_count < prompt_enhancement_threshold
-        )
-
-        global loaded_model, model_lock
-        
-        # Load model if not already loaded (simple caching)
-        if loaded_model is None and not model_lock:
-            model_lock = True
-            try:
-                # Set up model paths for the Q8 version
-                base_model_dir = os.path.dirname(job_params["ckpt_path"])
-                model_paths = {
-                    "transformer": job_params["ckpt_path"],
-                    "vae": os.path.join(base_model_dir, "vae"),
-                    "text_encoder": os.path.join(base_model_dir, "text_encoder"),
-                    "scheduler": os.path.join(base_model_dir, "scheduler"),
-                }
-                
-                logger.info(f"Using model paths: {model_paths}")
-                
-                # Add Q8-specific parameters to the pipeline creation
-                loaded_model = create_ltx_video_pipeline(
-                    ckpt_path=job_params["ckpt_path"],
-                    precision=job_params["precision"],
-                    text_encoder_model_name_or_path=job_params["text_encoder_model_name_or_path"],
-                    sampler=job_params.get("sampler"),
-                    device=job_params["device"],
-                    enhance_prompt=enhance_prompt,
-                    low_vram=job_params.get("low_vram", True),
-                    transformer_type=job_params.get("transformer_type", "q8_kernels"),
-                    # Provide explicit paths to each model component
-                    vae_path=model_paths["vae"],
-                    text_encoder_path=model_paths["text_encoder"],
-                    scheduler_path=model_paths["scheduler"]
-                )
-            finally:
-                model_lock = False
-                
-        pipeline = loaded_model
-        
-        # Prepare conditioning items
-        conditioning_items = None
-        if job_params.get("conditioning_media_paths"):
-            conditioning_items = prepare_conditioning(
-                conditioning_media_paths=job_params["conditioning_media_paths"],
-                conditioning_strengths=job_params["conditioning_strengths"],
-                conditioning_start_frames=job_params["conditioning_start_frames"],
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                padding=padding,
-                pipeline=pipeline
+        # Load conditioning image if provided
+        media_items = None
+        if temp_file:
+            media_items_prepad = load_image_to_tensor_with_resize_and_crop(
+                temp_file, height, width
+            )
+            media_items = F.pad(
+                media_items_prepad, padding, mode="constant", value=-1
             )
         
-        # Set spatiotemporal guidance
-        skip_block_list = [int(x.strip()) for x in job_params["stg_skip_layers"].split(",")]
-        stg_mode = job_params["stg_mode"].lower()
+        # Paths for the separate mode directories
+        ckpt_dir = Path(job_params["ckpt_dir"])
+        unet_path = job_params["unet_path"]
+        vae_dir = ckpt_dir / "vae"
+        scheduler_dir = ckpt_dir / "scheduler"
         
-        if stg_mode == "attention_values" or stg_mode == "stg_av":
-            skip_layer_strategy = SkipLayerStrategy.AttentionValues
-        elif stg_mode == "attention_skip" or stg_mode == "stg_as":
-            skip_layer_strategy = SkipLayerStrategy.AttentionSkip
-        elif stg_mode == "residual" or stg_mode == "stg_r":
-            skip_layer_strategy = SkipLayerStrategy.Residual
-        elif stg_mode == "transformer_block" or stg_mode == "stg_t":
-            skip_layer_strategy = SkipLayerStrategy.TransformerBlock
-        else:
-            skip_layer_strategy = SkipLayerStrategy.AttentionValues
+        # Load models
+        vae = load_vae(vae_dir)
+        unet = load_unet(unet_path, type=job_params["transformer_type"])
+        scheduler = load_scheduler(scheduler_dir)
+        patchifier = SymmetricPatchifier(patch_size=1)
+        text_encoder = T5EncoderModel.from_pretrained(
+            ckpt_dir, subfolder="text_encoder", torch_dtype=torch.bfloat16
+        )
+        if torch.cuda.is_available() and not job_params["low_vram"]:
+            text_encoder = text_encoder.to("cuda")
+        
+        tokenizer = T5Tokenizer.from_pretrained(
+            "PixArt-alpha/PixArt-XL-2-1024-MS", subfolder="tokenizer"
+        )
+        
+        unet = unet.to(torch.bfloat16)
+        if job_params["transformer_type"] == "q8_kernels":
+            for b in unet.transformer_blocks:
+                b.to(dtype=torch.float)
+            
+            for n, m in unet.transformer_blocks.named_parameters():
+                if "scale_shift_table" in n:
+                    m.data = m.data.to(torch.bfloat16)
+            
+            torch.cuda.synchronize()
+            unet.forward = make_dynamic_graphed_callable(unet.forward)
+        
+        # Use submodels for the pipeline
+        submodel_dict = {
+            "transformer": unet,
+            "patchifier": patchifier,
+            "text_encoder": text_encoder,
+            "tokenizer": tokenizer,
+            "scheduler": scheduler,
+            "vae": vae,
+        }
+        
+        pipeline = LTXVideoPipeline(**submodel_dict)
+        if torch.cuda.is_available() and not job_params["low_vram"]:
+            pipeline = pipeline.to("cuda")
         
         # Prepare input for the pipeline
         sample = {
@@ -408,8 +339,9 @@ def process_video_generation(job_params):
             "prompt_attention_mask": None,
             "negative_prompt": job_params["negative_prompt"],
             "negative_prompt_attention_mask": None,
+            "media_items": media_items,
         }
-
+        
         device = job_params["device"]
         generator = torch.Generator(device=device).manual_seed(job_params["seed"])
         
@@ -418,11 +350,6 @@ def process_video_generation(job_params):
             num_inference_steps=job_params["num_inference_steps"],
             num_images_per_prompt=1,
             guidance_scale=job_params["guidance_scale"],
-            skip_layer_strategy=skip_layer_strategy,
-            skip_block_list=skip_block_list,
-            stg_scale=job_params["stg_scale"],
-            do_rescaling=job_params["stg_rescale"] != 1,
-            rescaling_scale=job_params["stg_rescale"],
             generator=generator,
             output_type="pt",
             callback_on_step_end=None,
@@ -431,16 +358,16 @@ def process_video_generation(job_params):
             num_frames=num_frames_padded,
             frame_rate=job_params["frame_rate"],
             **sample,
-            conditioning_items=conditioning_items,
             is_video=True,
             vae_per_channel_normalize=True,
-            image_cond_noise_scale=job_params["image_cond_noise_scale"],
-            decode_timestep=job_params["decode_timestep"],
-            decode_noise_scale=job_params["decode_noise_scale"],
-            mixed_precision=(job_params["precision"] == "mixed_precision"),
-            offload_to_cpu=job_params.get("offload_to_cpu", False),
-            device=device,
-            enhance_prompt=enhance_prompt,
+            conditioning_method=(
+                ConditioningMethod.FIRST_FRAME
+                if media_items is not None
+                else ConditioningMethod.UNCONDITIONAL
+            ),
+            mixed_precision=False,
+            low_vram=job_params["low_vram"],
+            transformer_type=job_params["transformer_type"]
         ).images
         
         # Crop the padded images to the desired resolution and number of frames
@@ -460,13 +387,18 @@ def process_video_generation(job_params):
         fps = job_params["frame_rate"]
         
         # Get a unique filename for the output video
+        if media_items is not None:
+            base_filename = f"img_to_vid_{job_id}"
+        else:
+            base_filename = f"text_to_vid_{job_id}"
+            
         output_filename = get_unique_filename(
-            f"video_{job_id}",
+            base_filename,
             ".mp4",
             prompt=job_params["prompt"],
             seed=job_params["seed"],
             resolution=(height, width, num_frames),
-            dir=OUTPUT_DIR,
+            dir=Path(job_params["output_dir"]),
         )
         
         # Write video
@@ -494,11 +426,10 @@ def process_video_generation(job_params):
             "error": str(e)
         }
     finally:
-        # Clean up temporary files
-        for temp_file in temp_files:
+        # Clean up temporary file
+        if temp_file and os.path.exists(temp_file):
             try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
+                os.remove(temp_file)
             except Exception as e:
                 logger.error(f"Error removing temp file {temp_file}: {e}")
 
@@ -507,7 +438,7 @@ if __name__ == "__main__":
     
     # Check if model path environment variable is set
     if not os.environ.get("LTX_VIDEO_CKPT_PATH"):
-        logger.warning("LTX_VIDEO_CKPT_PATH environment variable not set. Using default ./models/ltx_video_q8_model.safetensors")
+        logger.warning("LTX_VIDEO_CKPT_PATH environment variable not set. Using default ./models")
     
     # Verify API key is set and warn if using default
     if API_KEY == "your-secret-key":

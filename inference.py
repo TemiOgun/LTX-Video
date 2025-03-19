@@ -59,6 +59,9 @@ def load_unet(unet_path, type="q8_kernels"):
 
     return transformer
 
+def get_device():
+    """Return the appropriate device for model operations."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_scheduler(scheduler_dir):
     scheduler_config_path = scheduler_dir / "scheduler_config.json"
